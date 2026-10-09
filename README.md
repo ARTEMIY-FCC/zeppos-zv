@@ -99,7 +99,7 @@ Russian.
 ```bash
 tools/make-demo.sh                    # bundled demo clip (license-free test pattern)
 cd watch && npm install && zeus build  # zeus CLI, Node 22
-node ../tools/preview.mjs             # QR code to install on a watch (zeus login required)
+node ../tools/preview.mjs "Amazfit Balance 2"  # install QR for your watch (zeus login required)
 ```
 
 The server is `server/app.py` (Python stdlib + numpy + ffmpeg) with a

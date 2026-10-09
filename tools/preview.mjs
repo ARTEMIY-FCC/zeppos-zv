@@ -4,6 +4,9 @@
 // shape and API level not below minVersion), catches the link that zeus only
 // draws in the terminal and saves the QR code as preview/qr.png (link and
 // expiry in preview/qr.txt). A zeus preview QR is valid for 7 days.
+//
+//   node tools/preview.mjs "Amazfit Balance 2"   — only the listed devices (comma-separated):
+//   the all-device package can get too big for the Zepp upload (HTTP 499).
 import { execSync, spawn } from 'node:child_process'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
@@ -92,7 +95,7 @@ function writeQrPng(text, file) {
   )
 }
 
-const devices = supportedDevices()
+const devices = process.argv[2] ? process.argv[2].split(',').map((d) => d.trim()) : supportedDevices()
 const tmp = mkdtempSync(join(tmpdir(), 'zv-qr-'))
 const urlFile = join(tmp, 'url.txt')
 const hook = join(tmp, 'hook.cjs')
@@ -115,11 +118,13 @@ Module._load = function (request) {
 `,
 )
 const args = ['--require', hook, zeusBin, 'preview', ...(devices.length ? ['-s', '-t', devices.join(',')] : [])]
+let gotUrl = false
 const status = await new Promise((resolve) => {
   const child = spawn(process.execPath, args, { cwd: APP, stdio: 'inherit' })
   child.on('exit', (code) => resolve(code ?? 1))
 })
 if (existsSync(urlFile)) {
+  gotUrl = true
   const url = readFileSync(urlFile, 'utf8').trim()
   const outDir = join(ROOT, 'preview')
   mkdirSync(outDir, { recursive: true })
@@ -134,4 +139,9 @@ if (existsSync(urlFile)) {
   console.log('\nQR: ' + relative(process.cwd(), join(outDir, 'qr.png')))
 }
 rmSync(tmp, { recursive: true, force: true })
+if (!gotUrl && status === 0) {
+  // zeus exits with 0 even when the upload fails
+  console.error('\nno QR link received — the upload failed, try again')
+  process.exit(1)
+}
 process.exit(status)
