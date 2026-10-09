@@ -44,7 +44,7 @@ COUB = "https://coub.com/api/v2/timeline/"
 SOURCES = ["community/memes/fresh?page=1", "hot/memes?page=1", "hot/memes?page=2",
            "community/memes/fresh?page=2", "random/memes?page=1"]
 PAGE = 20
-POOL = 30  # encoded clips not yet served that the server keeps in stock
+POOL = 30  # encoded clips not yet served that the server keeps in stock (split between qualities)
 UA = "Mozilla/5.0 (zeppos-video)"
 
 # Quality: frames per second and video kilobytes per second (sound adds 4 KB/s)
@@ -65,6 +65,9 @@ lock = threading.Lock()
 # feed, 2 — warm-up. A key may be queued twice — the second entry is skipped
 tasks = queue.PriorityQueue()
 seq = [0]
+running = {"bg": 0}
+# qualities the watches asked for recently: the warm-up keeps a stock in each of them
+wanted = {"mid": 0.0}
 meta = {}  # id → feed info (where to download from)
 # Catalog: everything seen in the Coub feeds, by discovery time (newest last).
 # served — clips already sent to a watch. Stored in the cache, survives restarts
@@ -157,11 +160,14 @@ def listing(q, seen, page):
     with lock:
         ids = [c for c in catalog if c not in seen]
     ids.sort(key=lambda c: catalog[c]["t"], reverse=True)
-    rd = [c for c in ids if ready(c, q)]
-    rest = [c for c in ids if not ready(c, q)]
-    order = rd + rest
+    has = {c: [x for x in QUALITY if ready(c, x)] for c in ids}
+    # encoded in the asked quality first, then encoded in another one (the watch
+    # may take that instead of waiting), then the rest
+    order = ([c for c in ids if q in has[c]] + [c for c in ids if has[c] and q not in has[c]]
+             + [c for c in ids if not has[c]])
     chunk = order[(page - 1) * PAGE:page * PAGE]
-    items = [{"id": c, "title": catalog[c]["title"], "dur": catalog[c]["dur"], "ready": ready(c, q)} for c in chunk]
+    items = [{"id": c, "title": catalog[c]["title"], "dur": catalog[c]["dur"], "ready": q in has[c], "has": has[c]}
+             for c in chunk]
     return {"items": items, "page": page, "next": page + 1 if len(order) > page * PAGE else 0}
 
 
@@ -269,27 +275,43 @@ def prepare(cid, q, prio=0):
             job["prio"] = prio
             seq[0] += 1
             tasks.put((prio, seq[0], key, cid, q))
-    return {k: job[k] for k in ("state", "p", "size", "err") if k in job}
+    out = {k: job[k] for k in ("state", "p", "size", "err") if k in job}
+    if job["state"] == "work" and not job["started"]:
+        out["queued"] = True
+    return out
 
 
 def worker():
     while True:
-        prio, _, key, cid, q = tasks.get()
+        prio, n, key, cid, q = tasks.get()
+        bg = prio >= 1  # prefetch or warm-up: nobody is staring at the screen yet
         with lock:
             job = jobs.get(key)
             if not job or job["state"] != "work" or job["started"]:
                 continue
-            job["started"] = True
-        encode_job(key, cid, q)
+            # one worker always stays free for a clip someone is waiting for
+            wait = bg and running["bg"] >= WORKERS - 1
+            if not wait:
+                job["started"] = True
+                running["bg"] += bg
+        if wait:
+            tasks.put((prio, n, key, cid, q))
+            time.sleep(1)
+            continue
+        try:
+            encode_job(key, cid, q)
+        finally:
+            with lock:
+                running["bg"] -= bg
 
 
 def prefetch(items, q="mid"):
     """The first unencoded items of a served feed jump the warm-up queue: they are shown next."""
     n = 0
     for it in items:
-        if n >= 4:
+        if n >= 3:
             break
-        if not it.get("ready"):
+        if not it.get("has"):
             prepare(it["id"], q, prio=1)
             n += 1
 
@@ -306,18 +328,23 @@ def warmer():
             if time.time() - last > DISCOVER_EVERY:
                 last = time.time()
                 discover()
+            now = time.time()
+            qs = sorted((q for q, t in wanted.items() if now - t < 3600), key=lambda q: -wanted[q]) or ["mid"]
             with lock:
                 ids = sorted(catalog, key=lambda c: catalog[c]["t"], reverse=True)
-                busy = sum(1 for j in jobs.values() if j["state"] == "work")
-            stock = sum(1 for c in ids if c not in served and ready(c, "mid"))
-            need = POOL - stock - busy
-            for c in ids:
-                if need <= 0:
-                    break
-                if c in served or ready(c, "mid") or f"{c}-mid" in jobs and jobs[f"{c}-mid"]["state"] != "error":
-                    continue
-                prepare(c, "mid", prio=2)
-                need -= 1
+            for q in qs:
+                with lock:
+                    busy = sum(1 for k, j in jobs.items() if j["state"] == "work" and k.endswith("-" + q))
+                stock = sum(1 for c in ids if c not in served and ready(c, q))
+                need = POOL // len(qs) - stock - busy
+                for c in ids:
+                    if need <= 0:
+                        break
+                    key = f"{c}-{q}"
+                    if c in served or ready(c, q) or key in jobs and jobs[key]["state"] != "error":
+                        continue
+                    prepare(c, q, prio=2)
+                    need -= 1
             if state_dirty[0]:
                 save_state()
         except Exception as e:  # noqa: BLE001
@@ -361,6 +388,7 @@ class Handler(BaseHTTPRequestHandler):
                 page = max(1, min(100, int(qs.get("page", "1") or 1)))
                 q = qs.get("q", "mid") if qs.get("q") in QUALITY else "mid"
                 seen = set(x for x in qs.get("seen", "").split(",") if x)
+                wanted[q] = time.time()
                 if not catalog:
                     discover()
                 out = listing(q, seen, page)
@@ -371,7 +399,8 @@ class Handler(BaseHTTPRequestHandler):
                 q = qs.get("q", "mid")
                 if not re.fullmatch(r"[A-Za-z0-9]{3,20}", cid) or q not in QUALITY:
                     return self.send(400, {"state": "error", "err": "Неверный запрос"})
-                return self.send(200, prepare(cid, q))
+                # prio=1 — the phone fetches the next clip in advance, nobody waits yet
+                return self.send(200, prepare(cid, q, prio=1 if qs.get("prio") == "1" else 0))
             m = re.fullmatch(r"/v1/f/([A-Za-z0-9]{3,20})-(low|mid|high)\.zv", u.path)
             if m:
                 p = path_of(m.group(1), m.group(2))

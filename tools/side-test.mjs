@@ -57,6 +57,18 @@ const ask = (method, params) => new Promise((res) => svc.onRequest({ method, par
 const list = await ask('list', { page: 1 })
 console.log('list:', list.error || list.items.length + ' clips, first ' + JSON.stringify(list.items[0]))
 const t = Date.now()
-const got = await ask('get', { id: list.items[0].id, q: 'mid' })
+const got = await ask('get', { id: list.items[0].id, q: 'mid', cur: 1 })
 console.log('get:', JSON.stringify(got), Date.now() - t, 'ms')
 console.log('messages to the watch:', calls.map((c) => c.stage + ':' + Math.round((c.p || 0) * 100)).join(' '))
+
+// a prefetch must be dropped as soon as the watch asks for another clip
+const notReady = list.items.filter((it) => !(it.has || []).includes('high'))
+if (notReady.length >= 2) {
+  const pre = ask('get', { id: notReady[0].id, q: 'high', cur: 0 })
+  await new Promise((r) => setTimeout(r, 1500))
+  const cur = ask('get', { id: notReady[1].id, q: 'high', cur: 1 })
+  const p = await pre
+  console.log('prefetch after a new current request:', JSON.stringify(p), p.error === 'отменено' ? 'OK' : 'NOT CANCELLED')
+  const c = await cur
+  console.log('current:', JSON.stringify(c))
+}

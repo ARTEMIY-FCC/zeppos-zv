@@ -4,13 +4,16 @@
  * The watch asks:
  *   list {page, q}  → {items: [{id, title, dur}], next}
  *   get  {id, q}    → {file}  — once the .zv file is on the watch
- * Along the way the phone sends {ev: 'prog', id, stage, p}: stage = server
- * (the server encodes), load (the phone downloads), send (Bluetooth transfer).
+ *   (params.cur = 0 marks a prefetch of the next clip; a new current request
+ *   cancels every other clip that has not reached the Bluetooth queue yet)
+ * Along the way the phone sends {ev: 'prog', id, q, stage, p}: stage = queue
+ * (waiting for a free encoder), server (encoding), load (the phone downloads),
+ * send (Bluetooth transfer).
  *
  * Videos are encoded by the server (server/app.py): the phone side has neither
  * ffmpeg nor file writing — a file reaches the watch only as "download a URL →
- * transfer". Deliveries go one at a time: there is one Bluetooth link, and the
- * watch asks for the next clip in advance while the current one plays.
+ * transfer". The watch asks for the next clip in advance while the current one
+ * plays.
  * Error messages are shown on the watch, so they are in Russian.
  */
 import { BaseSideService, settingsLib } from '@zeppos/zml/base-side'
@@ -44,8 +47,7 @@ function sleep(ms) {
 AppSideService(
   BaseSideService({
     onInit() {
-      this.queue = Promise.resolve()
-      this.inflight = {} // id-q → Promise
+      this.jobs = {} // id-q → { id, q, key, cur, cancelled, sending, promise }
       log('side init')
     },
 
@@ -101,8 +103,16 @@ AppSideService(
           reject(new Error('Телефон не смог скачать'))
           return
         }
-        task.onSuccess = (data) => resolve((data && data.filePath) || 'data://download/' + fileName)
-        task.onFail = () => reject(new Error('Телефон не смог скачать ролик'))
+        // the downloader may never call back: do not let a delivery hang forever
+        const timer = setTimeout(() => reject(new Error('Телефон не смог скачать ролик')), 90000)
+        task.onSuccess = (data) => {
+          clearTimeout(timer)
+          resolve((data && data.filePath) || 'data://download/' + fileName)
+        }
+        task.onFail = () => {
+          clearTimeout(timer)
+          reject(new Error('Телефон не смог скачать ролик'))
+        }
       })
     },
 
@@ -154,47 +164,72 @@ AppSideService(
       })
     },
 
-    /** One clip to the watch: server encodes → phone downloads → Bluetooth. */
-    async deliver(id, q) {
-      const key = id + '-' + q
-      let last = -1
+    /**
+     * One clip to the watch: server encodes → phone downloads → Bluetooth.
+     * Jobs run side by side (most of the time is spent waiting for the server);
+     * a job the watch no longer needs stops at the next checkpoint, so stale
+     * clips never get into the Bluetooth queue.
+     */
+    async deliver(job) {
+      const { id, q, key } = job
+      const check = () => {
+        if (job.cancelled) throw new Error('отменено')
+      }
+      let last = ''
       for (let i = 0; ; i++) {
-        const st = await this.api('/v1/prepare', { id, q }, 15000)
+        check()
+        const st = await this.api('/v1/prepare', { id, q, prio: job.cur ? 0 : 1 }, 15000)
         if (st.state === 'ready') break
-        if (st.p !== last) {
-          last = st.p
-          this.tell({ ev: 'prog', id, stage: 'server', p: (st.p || 0) / 100 })
+        const mark = (st.queued ? 'q' : 's') + (st.p || 0)
+        if (mark !== last && job.cur) {
+          last = mark
+          this.tell({ ev: 'prog', id, q, stage: st.queued ? 'queue' : 'server', p: (st.p || 0) / 100 })
         }
-        if (i > 150) throw new Error('Сервер сжимает слишком долго')
+        if (i > 400) throw new Error('Сервер сжимает слишком долго')
         await sleep(1000)
       }
-      this.tell({ ev: 'prog', id, stage: 'load', p: 0 })
+      check()
+      if (job.cur) this.tell({ ev: 'prog', id, q, stage: 'load', p: 0 })
       const name = 'zv_' + key + '.zv'
       const path = await this.fetchFile(this.apiUrl('/v1/f/' + key + '.zv'), name)
-      this.tell({ ev: 'prog', id, stage: 'send', p: 0 })
+      check()
+      job.sending = true
+      this.tell({ ev: 'prog', id, q, stage: 'send', p: 0 })
       let at = 0
       const t0 = Date.now()
       await this.sendToWatch(path, { k: key, id, q }, (done, total) => {
         const now = Date.now()
         if (now - at < 400) return
         at = now
-        this.tell({ ev: 'prog', id, stage: 'send', p: done / total, bps: (done / Math.max(1, now - t0)) * 1000 })
+        this.tell({ ev: 'prog', id, q, stage: 'send', p: done / total, bps: (done / Math.max(1, now - t0)) * 1000 })
       })
       log('delivered', key, Date.now() - t0, 'ms')
       return { file: name, key }
     },
 
-    getVideo(id, q) {
+    /** cur — the clip the watch is waiting for right now (not a prefetch). */
+    getVideo(id, q, cur) {
       const key = id + '-' + q
-      if (this.inflight[key]) return this.inflight[key]
-      // one delivery at a time
-      const p = (this.queue = this.queue.catch(() => {}).then(() => this.deliver(id, q)))
-      this.inflight[key] = p
-      p.then(
-        () => delete this.inflight[key],
-        () => delete this.inflight[key],
-      )
-      return p
+      if (cur) {
+        // the person moved on: every other clip not yet on its way is stale
+        for (const k in this.jobs) if (k !== key && !this.jobs[k].sending) this.jobs[k].cancelled = true
+      }
+      let job = this.jobs[key]
+      if (job) {
+        // asked again (e.g. swiped back) before the stale job noticed — keep it running
+        if (cur) {
+          job.cur = true
+          job.cancelled = false
+        }
+        return job.promise
+      }
+      job = this.jobs[key] = { id, q, key, cur: !!cur, cancelled: false, sending: false }
+      const done = () => {
+        if (this.jobs[key] === job) delete this.jobs[key]
+      }
+      job.promise = this.deliver(job)
+      job.promise.then(done, done)
+      return job.promise
     },
 
     onRequest(req, res) {
@@ -203,7 +238,7 @@ AppSideService(
       const q = ['low', 'mid', 'high'].indexOf(params.q) >= 0 ? params.q : 'mid'
       let job
       if (method === 'list') job = this.api('/v1/list', { page: params.page || 1, q, seen: String(params.seen || '') })
-      else if (method === 'get') job = this.getVideo(String(params.id || ''), q)
+      else if (method === 'get') job = this.getVideo(String(params.id || ''), q, params.cur !== 0)
       else job = Promise.reject(new Error('unknown method'))
       job.then(
         (out) => res(null, out),

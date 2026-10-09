@@ -10,8 +10,8 @@ from the public Coub API, encodes them with `encoder/zv.py` and serves the
 
 | Request | Response |
 | --- | --- |
-| `GET /v1/list?page=1&q=mid&seen=id1,id2` | `{items: [{id, title, dur, ready}], page, next}` — newest first, already encoded ones ahead, ids in `seen` left out |
-| `GET /v1/prepare?id=<coub>&q=mid` | `{state: "work"\|"ready"\|"error", p, size, err}` — starts encoding if needed, `p` is progress in percent |
+| `GET /v1/list?page=1&q=mid&seen=id1,id2` | `{items: [{id, title, dur, ready, has}], page, next}` — newest first; encoded in `q` ahead, then encoded in another quality (`has` lists them), ids in `seen` left out |
+| `GET /v1/prepare?id=<coub>&q=mid&prio=0` | `{state: "work"\|"ready"\|"error", p, size, err, queued}` — starts encoding if needed, `p` is progress in percent, `queued` while waiting for an encoder; `prio=1` marks a prefetch |
 | `GET /v1/f/<coub>-<q>.zv` | the file |
 | `GET /v1/health` | `{ok, version}` |
 
@@ -28,9 +28,11 @@ Texts in `err` are shown on the watch and are in Russian.
   clips already served; stored in `CACHE/state.json`, entries older than a week
   are dropped.
 - **Stock:** the server keeps about `POOL = 30` encoded clips that have not
-  been served yet and tops the stock up every minute.
+  been served yet, split between the qualities watches asked for in the last
+  hour, and tops the stock up every minute.
 - **Queue:** `WORKERS = 3` encoder threads with priorities — a clip someone is
-  waiting for (0), the next unencoded clips of a served list (1), warm-up (2).
+  waiting for (0), prefetches (1), warm-up (2). Prefetch and warm-up never take
+  the last free thread, so a clip someone waits for starts encoding at once.
 - **Cache:** encoded files live for two days after their last download.
 
 ## Running

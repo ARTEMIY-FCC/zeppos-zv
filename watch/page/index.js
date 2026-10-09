@@ -281,7 +281,26 @@ Page(
       this.open(i)
     },
 
+    /** Qualities to try, the chosen one first. */
+    order() {
+      return { low: ['low', 'mid', 'high'], mid: ['mid', 'high', 'low'], high: ['high', 'mid', 'low'] }[this.q]
+    },
+
+    here(key) {
+      const f = this.files[key]
+      return !!(f && fsx.size('download/' + f.name))
+    },
+
+    /**
+     * Which file to show for an item: one already on the watch in any quality,
+     * else one the server has ready (closest to the chosen quality) — so a
+     * quality switch never waits for encoding — else the chosen quality.
+     */
     key(item) {
+      const order = this.order()
+      for (let i = 0; i < order.length; i++) if (this.here(item.id + '-' + order[i])) return item.id + '-' + order[i]
+      const has = item.has || (item.ready ? [this.q] : [])
+      for (let i = 0; i < order.length; i++) if (has.indexOf(order[i]) >= 0) return item.id + '-' + order[i]
       return item.id + '-' + this.q
     },
 
@@ -297,34 +316,53 @@ Page(
       this.img.setProperty(hmUI.prop.SRC, '')
       this.showTitle(item.title)
       if (this.playIfHere(key)) return
-      this.say('Сервер сжимает ролик…')
-      this.fetchVideo(item, key)
+      this.say('Готовлю ролик…')
+      this.fetchVideo(item, key, true)
     },
 
-    /** Ask the phone to deliver a clip; the answer comes once the file is on the watch. */
-    fetchVideo(item, key) {
-      if (this.requested && this.requested[key]) return
+    /**
+     * Ask the phone to deliver a clip; the answer comes once it is handed to
+     * Bluetooth. cur — the clip is wanted right now: the phone serves it first
+     * and drops stale prefetches.
+     */
+    fetchVideo(item, key, cur) {
       this.requested = this.requested || {}
+      if (this.requested[key] && !cur) return
       this.requested[key] = true
-      this.ask('get', { id: item.id, q: this.q }, GET_TIMEOUT).then(
+      const q = key.slice(key.lastIndexOf('-') + 1)
+      this.ask('get', { id: item.id, q, cur: cur ? 1 : 0 }, GET_TIMEOUT).then(
         (res) => {
           delete this.requested[key]
-          if (res && res.file) this.remember(key, res.file)
-          if (this.current === key) this.whenArrived(key, 0)
+          if (res && res.file && !this.files[key]) this.remember(key, res.file)
+          if (this.current === key && this.player.phase === 'idle') {
+            this.say('Передаю на часы…')
+            this.whenArrived(key)
+          }
         },
         (e) => {
           delete this.requested[key]
-          if (this.current === key) this.say((e && e.message) || 'Не получилось загрузить')
+          if (this.current !== key) return
+          const msg = (e && e.message) || ''
+          // dropped as stale while we came back to it — ask again
+          if (msg.indexOf('отмен') >= 0) this.fetchVideo(item, key, true)
+          else this.say(msg || 'Не получилось загрузить')
         },
       )
     },
 
-    /** The file may not be closed yet when the phone answers — retry a few times. */
-    whenArrived(key, tries) {
-      if (this.closed || this.current !== key) return
-      if (this.playIfHere(key)) return
-      if (tries < 20) setTimeout(() => this.whenArrived(key, tries + 1), 500)
-      else this.say('Ролик не дошёл — свайпните ещё раз')
+    /** Wait for the file (Bluetooth may take a while); onReceivedFile also lands here. */
+    whenArrived(key) {
+      if (this.arriveTimer) clearTimeout(this.arriveTimer)
+      this.arriveTimer = null
+      const started = Date.now()
+      const poll = () => {
+        this.arriveTimer = null
+        if (this.closed || this.current !== key || this.player.phase !== 'idle') return
+        if (this.playIfHere(key)) return
+        if (Date.now() - started < 180000) this.arriveTimer = setTimeout(poll, 1000)
+        else this.say('Ролик не дошёл — свайпните ещё раз')
+      }
+      poll()
     },
 
     playIfHere(key) {
@@ -354,9 +392,7 @@ Page(
     /** Is the next clip already on the watch? */
     nextHere() {
       const next = this.items[this.idx + 1]
-      if (!next) return false
-      const f = this.files[this.key(next)]
-      return !!(f && fsx.size('download/' + f.name))
+      return !!next && this.here(this.key(next))
     },
 
     /** The next clip travels to the watch while this one plays. */
@@ -364,9 +400,8 @@ Page(
       const next = this.items[this.idx + 1]
       if (!next) return
       const key = this.key(next)
-      const f = this.files[key]
-      if (f && fsx.size('download/' + f.name)) return
-      this.fetchVideo(next, key)
+      if (this.here(key)) return
+      this.fetchVideo(next, key, false)
     },
 
     remember(key, name) {
@@ -422,9 +457,11 @@ Page(
       if (!m || m.ev !== 'prog') return
       const item = this.items[this.idx]
       if (!item || item.id !== m.id || this.player.phase !== 'idle') return
+      if (m.q && this.current !== m.id + '-' + m.q) return
       const pct = Math.round((m.p || 0) * 100)
-      if (m.stage === 'server') this.say('Сервер сжимает ролик ' + pct + '%')
-      else if (m.stage === 'load') this.say('Телефон скачивает…')
+      if (m.stage === 'queue') this.say('Ролик в очереди на сервере…')
+      else if (m.stage === 'server') this.say('Сервер сжимает ролик ' + pct + '%')
+      else if (m.stage === 'load') this.say('Телефон скачивает ролик…')
       else if (m.stage === 'send') {
         const speed = m.bps ? '\n' + Math.round(m.bps / 1024) + ' КБ/с' : ''
         this.say('Передаю на часы ' + pct + '%' + speed)
@@ -446,7 +483,7 @@ Page(
       const name = String(file.fileName || file.filePath || '').replace(/^.*\//, '') || 'zv_' + key + '.zv'
       const done = () => {
         this.remember(key, name)
-        if (this.current === key && this.player.phase === 'idle') this.whenArrived(key, 0)
+        if (this.current === key && this.player.phase === 'idle') this.whenArrived(key)
       }
       if (file.readyState === 'transferred') {
         done()
@@ -515,6 +552,7 @@ Page(
     onDestroy() {
       this.closed = true
       if (this.titleTimer) clearTimeout(this.titleTimer)
+      if (this.arriveTimer) clearTimeout(this.arriveTimer)
       if (this.player) this.player.unload()
       audio.stopNow()
       try {
