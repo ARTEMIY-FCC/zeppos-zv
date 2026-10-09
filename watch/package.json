@@ -1,0 +1,14 @@
+{
+  "name": "zeppos-video",
+  "version": "1.0.0",
+  "description": "ZV: full-screen video for Zepp OS watches (example app: meme feed)",
+  "type": "module",
+  "private": true,
+  "devDependencies": {
+    "@zeppos/device-types": "^4.0.0"
+  },
+  "dependencies": {
+    "@zeppos/zml": "^0.0.43"
+  },
+  "license": "MIT"
+}

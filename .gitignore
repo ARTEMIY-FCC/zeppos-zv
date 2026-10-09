@@ -1,0 +1,8 @@
+node_modules/
+watch/dist/
+watch/.preview/
+preview/
+__pycache__/
+.DS_Store
+# the bundled demo clip is generated: tools/make-demo.sh
+watch/assets/*/demo.zv

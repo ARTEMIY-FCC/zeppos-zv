@@ -1,0 +1,32 @@
+{
+  "configVersion": "v3",
+  "app": {
+    "appType": "app",
+    "version": { "code": 1, "name": "1.0.0" },
+    "appId": 1101010,
+    "appName": "Мемы",
+    "icon": "icon.png",
+    "vender": "zepp",
+    "description": "Видеомемы на весь экран: свой видеокодек для часов"
+  },
+  "runtime": {
+    "apiVersion": { "compatible": "3.0.0", "target": "4.0.0", "minVersion": "3.0" }
+  },
+  "permissions": ["data:os.device.info", "device:os.local_storage", "device:os.ble", "device:transfer", "side:network", "device:media"],
+  "targets": {
+    "gt": {
+      "module": {
+        "page": { "pages": ["page/index"] },
+        "app-side": { "path": "app-side/index" }
+      },
+      "platforms": [{ "st": "r", "dw": 480 }, { "st": "s", "dw": 390 }],
+      "designWidth": 480
+    }
+  },
+  "i18n": {
+    "ru-RU": { "appName": "Мемы" },
+    "en-US": { "appName": "Memes" }
+  },
+  "defaultLanguage": "ru-RU",
+  "debug": false
+}
